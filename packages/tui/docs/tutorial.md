@@ -78,7 +78,7 @@ Everything mode-specific lives behind that line.
 | `src/oklab.ts` | — | OKLab/OKLCH/OKHSL conversions behind `colors.ts`. |
 | `src/terminal-image.ts` | — | Capability detection, Kitty/iTerm2 encoding, `renderImage`, cell dimensions, hyperlinks. |
 | `src/latex.ts` | — | `renderLatex`: math typeset into terminal lines. |
-| `src/components/` | 18 files | The widget set — see §10. |
+| `src/components/` | 18 files | The widget set — see §11. |
 | `src/alt-screen-search.ts` | — | Transcript search index used by `TuiAltScreen`. |
 
 ## 4. The component contract
