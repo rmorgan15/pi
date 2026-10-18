@@ -380,7 +380,96 @@ registerStorageConformance({ describe, expect, it }, "My Storage", async (use) =
 });
 ```
 
-## 10. Failure, in one paragraph per rule
+## 10. The task state machine
+
+Everything else in this package exists to move a task record between six committed states. The
+states are not an enum of convenience — each carries the fields that make it resumable, and the
+union in `types.ts:592–636` is the authority:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> pending: task created inside a commit
+    pending --> running: reservation commit reserves it
+    running --> pending: abort mark, scheduler close, or restart scan
+    running --> waiting: join on child tasks, checkpoint kept
+    running --> sleeping: sleep until a clock deadline
+    running --> completing: outcome committed
+    waiting --> pending: every task in on is terminal
+    waiting --> completing: failFast sees a failed child
+    sleeping --> pending: clock deadline reached
+    completing --> terminal: no ordinary owned work below stays live
+    terminal --> [*]
+    note right of completing : runs no more code, only waits to settle
+    note right of sleeping : an abort mark does not wait for it
+```
+
+| State | Carries | Leaves when |
+|---|---|---|
+| `pending` | `checkpoint` | A reservation commit claims it (`status: "running"`, scheduler.ts:1510) |
+| `running` | `checkpoint` | Outcome, join, sleep, abort, close, or a restart scan (`scheduler.ts:373`, `509`, `1729`) |
+| `waiting` | `checkpoint`, `on`, `policy` | Every task in `on` is terminal — or `failFast` sees one fail |
+| `sleeping` | `checkpoint`, `until` | The `HarnessOptions.now` clock reaches `until`; an abort does not wake it |
+| `completing` | `outcome` | No ordinary owned work below it is live (`scheduler.ts:1806`, `844`) |
+| `terminal` | `outcome` | Never; this is the durable receipt (`scheduler.ts:1809`) |
+
+`LIVE_STATUSES` (scheduler.ts:58) is the five non-terminal states, and it is what every recovery
+scan iterates. Two consequences worth internalizing:
+
+- **`completing` is a barrier, not a formality.** A task whose outcome is decided still waits for
+  its ordinary owned children to settle, so a parent never becomes `terminal` while a child can
+  still write. Background children are excluded from that wait by design.
+- **`running` is only ever in memory.** It means "one in-memory invocation reserved this", which is
+  why a crash leaves records in `running` and the next open must reinterpret them
+  (scheduler.ts:370–375). A clean `close()` writes them back to `pending` and deliberately does not
+  count a restart — the comment at scheduler.ts:502–506 is explicit that *"a close is not a crash"*.
+  A task that exceeds the restart limit is parked, reported by `blockedReason()` as
+  `"restart_limit"`, and only `retry()` clears the count.
+
+## 11. Inside the scheduler: one pass
+
+`scheduler.ts` is 2,368 lines because each of these phases has to be crash-safe, but the shape of a
+pass is small: something becomes dirty, the scheduler drains, a reservation commit claims work, and
+each claimed task is stepped inside its own transaction.
+
+```mermaid
+sequenceDiagram
+    participant W as writer (any commit)
+    participant S as Scheduler
+    participant TX as Transaction
+    participant I as task invocation
+    W->>S: notify (commit landed, timer fired, registry changed)
+    S->>S: #drain() while dirty and enabled
+    S->>TX: #reserve() — one commit, every eligible task
+    TX-->>S: reservations (pending to running)
+    S->>I: #start() then #run(reservation)
+    I->>TX: #step(): commit progress, checkpoint, documents
+    alt outcome decided
+        I->>TX: #terminate(): running to completing
+        TX-->>TX: completing to terminal when owned work drains
+    else needs to wait or sleep
+        I->>TX: to waiting(on, policy) or sleeping(until)
+    else aborted
+        I->>TX: #runAbort(): handler runs, or the task is orphaned
+    end
+```
+
+The pieces, in the order a reader should look at them:
+
+| Phase | Function | What it guarantees |
+|---|---|---|
+| Recovery | `#reconcile` (scheduler.ts:753) | Rebuilds in-memory indexes from a scan of `LIVE_STATUSES`; reinterprets `running` records; schedules `failFast` checks |
+| Trigger | `#kick` / `#drain` (scheduler.ts:1413) | Coalesces wakeups; a wakeup that arrives after the last check re-kicks itself |
+| Reservation | `#reserve` (scheduler.ts:1433) | Claims every eligible task **in one commit**, so two scheduler instances cannot both claim |
+| Execution | `#run` (scheduler.ts:1673) | Runs the definition; owns abort handling and restart counting |
+| Progress | `#step` (scheduler.ts:1767) | Commits checkpoints, writes, and state transitions together |
+| Settling | `#terminate` (scheduler.ts:1803) | `completing` first, `terminal` when the subtree drains |
+
+`blockedReason()` (scheduler.ts:425) is the other half of the story: it answers *why not* for
+status UIs — `"restart_limit"`, a missing or too-old definition, a failed migration — and returns
+`undefined` for tasks that are running, abort-marked, or already holding an outcome.
+
+## 12. Failure, in one paragraph per rule
 
 From [README §Errors](../README.md#errors) and [spec.md §10.1](spec.md#10-storage-contract):
 
@@ -399,7 +488,7 @@ From [README §Errors](../README.md#errors) and [spec.md §10.1](spec.md#10-stor
    `RegistryReader.snapshot()` that throws — without a registry the Harness cannot
    schedule, so that fails everything.
 
-## 11. The extension surface
+## 13. The extension surface
 
 ```ts
 import { defineExtension, defineTool, section, hook, wrapTool, wrapSection } from "./harness/define.ts";
@@ -438,7 +527,7 @@ export function createCodingTools(options: ReadToolOptions = {}) {
 }
 ```
 
-## 12. Where to work on what
+## 14. Where to work on what
 
 | Task | Start here |
 | --- | --- |

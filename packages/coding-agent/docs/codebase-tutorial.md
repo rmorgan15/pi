@@ -141,6 +141,62 @@ flowchart LR
     W --> X{{"LLM provider"}}
 ```
 
+## Startup, step by step
+
+`main()` (main.ts:574) is 425 lines of sequencing, and the order is the design: cheap shortcuts
+first, then settings, then the cwd, then services, then a mode. Most "why doesn't `--flag` work
+here?" questions are answered by where a step sits in this list.
+
+```mermaid
+sequenceDiagram
+    participant M as main()
+    participant S as SettingsManager
+    participant SM as SessionManager
+    participant RT as AgentSessionRuntime
+    participant SV as session services
+    participant MD as mode runner
+    M->>M: resetTimings, theme validator, offline flags
+    M->>M: shortcut commands (auth, package, config, mcp)
+    M->>M: parseArgs, then --version and --export exits
+    M->>S: bootstrap manager, projectTrusted false
+    M->>M: runMigrations, first-time setup, theme override
+    M->>SM: createSessionManager(sessionDir)
+    SM-->>M: session and its cwd
+    M->>RT: createAgentSessionRuntime(createRuntime)
+    RT->>SV: createAgentSessionServices(projectTrusted)
+    SV-->>RT: settings, modelRuntime, resourceLoader, session
+    M->>M: help and listModels exits, piped stdin, initial message
+    M->>MD: runRpcMode or InteractiveMode.run or runPrintMode
+```
+
+| Phase | Where | What it decides |
+|---|---|---|
+| Timings and extension factories | main.ts:574–578 | `time()` markers for `PI_STARTUP_BENCHMARK`; built-ins plus injected factories |
+| Offline mode | main.ts:579–583 | Sets `PI_OFFLINE` and `PI_SKIP_VERSION_CHECK` from flag or env |
+| Shortcut commands | main.ts:585–621 | `auth`, `package`, `config`, `mcp` each get a chance to own the process and exit |
+| Argument parsing | main.ts:623–652 | Diagnostics can exit 1; `--version` and `--export` exit here |
+| Bootstrap settings | main.ts:596 | Created with `projectTrusted: false` — project config is not trusted yet |
+| Migrations and first-run | main.ts:669–684 | Auth-provider migration, deprecation warnings, theme prompt, theme override |
+| Session selection | main.ts:686–718 | Session dir resolves *before* any cwd-bound service, because `--resume` may change the project |
+| Trust store | main.ts:720–731 | `ProjectTrustStore`, per-cwd cache, CLI path resolution |
+| Runtime factory | main.ts:733–864 | A closure, so a reload can rebuild services with a new `projectTrusted` and a new agent instance |
+| Runtime creation | main.ts:866–872 | `createAgentSessionRuntime` runs the factory once and returns `services`, `session`, diagnostics |
+| Early exits | main.ts:878–892 | `--help` and `--listModels` print and exit after services exist, so extension flags appear in help |
+| Input | main.ts:894–906 | Piped stdin turns interactive into print mode; theme initialised last |
+| Diagnostics gate | main.ts:915–925 | Any runtime error exits 1 before a mode starts; an extension-load failure adds a hint |
+| Mode dispatch | main.ts:949–998 | RPC, then interactive, then print |
+
+Two invariants that explain a lot of the file's structure:
+
+- **The project-trust decision is deferred, not defaulted.** The bootstrap manager at main.ts:596
+  cannot read project settings, because trust is not established; the real manager is built inside
+  the factory at main.ts:751 with the resolved value. Anything that needs project config therefore
+  lives behind `createRuntime`.
+- **The factory is re-run, not re-invented, on reload.** `createRuntime` takes `sessionStartEvent`
+  and treats its absence as "initial runtime" (main.ts:740), which is how extension reloads and
+  trust changes rebuild services without duplicating startup logic. `projectTrustByCwd` caches the
+  answer per directory so a reload does not re-prompt.
+
 ## The agent loop
 
 `packages/agent/src/agent-loop.ts` is the whole runtime model. The exported surface is

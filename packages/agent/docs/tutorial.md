@@ -100,7 +100,7 @@ Two things that surprise newcomers:
 
 1. **The system prompt lives in the transcript.** `state.systemPrompt` is a *getter* that
    replays it from the leading system message (`getCurrentSystemPrompt(messages)`,
-   agent.ts:88–91). Setting `initialState.systemPrompt` or `initialState.tools` seeds that
+   agent.ts:89–91). Setting `initialState.systemPrompt` or `initialState.tools` seeds that
    message via `createInitialSystemMessage` (agent.ts:85–86). To change the prompt later you
    append a system message — you do not reassign a field.
 2. **Tools are declared twice, deliberately.** `context.tools` is what the runtime can
@@ -303,7 +303,79 @@ message* with `stopReason: "error" | "aborted"` and `errorMessage`, emitted as
 `message_start` → `message_end` → `turn_end` → `agent_end` (agent.ts:532–548). Consumers
 therefore never need a separate error channel.
 
-## 9. `stream-fn.ts` and `proxy.ts`
+## 9. Run lifecycle: the state machine behind the events
+
+The event list in §8 reads like a trace; the thing that produces it is a small state machine with
+two levels. `activeRun` (agent.ts:218) is the lock: `runWithLifecycle` refuses a second concurrent
+run with `"Agent is already processing."` (agent.ts:508–510) rather than queueing.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Claimed: prompt() or continue() sets activeRun
+    Claimed --> Idle: throws Agent is already processing
+    state Running {
+        [*] --> Streaming
+        Streaming --> Streaming: message_update, tool_execution_update
+        Streaming --> Tools: assistant message carries tool calls
+        Tools --> Streaming: results appended, next turn
+        Tools --> Tools: parallel batch, results in source order
+    }
+    Claimed --> Running: agent_start, turn_start
+    Running --> Finishing: no tool calls and no follow-up
+    Running --> Finishing: stopReason error or aborted
+    Running --> Failing: executor throws
+    Failing --> Idle: synthetic message_start, message_end, turn_end, agent_end
+    Finishing --> Idle: agent_end, then finishRun clears state
+    Idle --> Idle: steer() and followUp() only enqueue
+```
+
+Two details the diagram makes obvious but the prose hides:
+
+- **`agent_end` is not the idle boundary.** The comment on `processEvents` (agent.ts:558–564) is
+  explicit: `agent_end` means no further loop events will be emitted, but the run is idle only
+  after every awaited listener for `agent_end` returns and `finishRun()` (agent.ts:550) clears
+  `isStreaming`, `streamingMessage`, `pendingToolCalls`, and `activeRun`. A host that starts a new
+  prompt from inside its `agent_end` handler hits the `activeRun` guard.
+- **Abort does not add a state.** `abort()` (agent.ts:341) aborts the signal; the loop notices at
+  its next checkpoint and breaks out at `stopReason` handling (agent-loop.ts:245), so the machine
+  leaves `Running` through the same `Finishing` edge as a normal turn.
+
+### Failure paths, and the synthetic message
+
+Every failure that escapes the loop becomes a well-formed assistant message, so a host never needs
+a second error channel:
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant A as Agent
+    participant L as runLoop
+    participant S as subscribed listener
+    C->>A: prompt(...)
+    A->>L: runWithLifecycle(executor)
+    L--xA: throws (adapter, tool, or listener error)
+    A->>S: message_start (synthetic, empty text, stopReason error or aborted)
+    A->>S: message_end
+    A->>S: turn_end (toolResults: [])
+    A->>S: agent_end
+    A->>A: finishRun() clears activeRun
+    Note over A, S: the failure is a message, not a rejected promise
+```
+
+`handleRunFailure` (agent.ts:532–548) builds that message with `EMPTY_USAGE`, `stopReason` chosen
+from `signal.aborted`, and the error text in `errorMessage`; `prompt()` itself resolves normally.
+
+| Failure | Where it is caught | What the host sees |
+|---|---|---|
+| Provider returns `stopReason: "error"` or `"aborted"` | agent-loop.ts:245 breaks the loop | The provider's message, kept in `messages`; no tool calls run |
+| `abort()` called mid-stream | Loop checkpoint, then the same break | Partial text kept, `stopReason: "aborted"` |
+| `abort()` called mid-tool | agent-loop.ts:613–623, 738–741, 757–760 | `createErrorToolResult("Operation aborted")` per in-flight call |
+| A tool implementation throws | `executeToolCall` catch | `createErrorToolResult(error.message)`; the turn continues |
+| A listener throws during `agent_end` | `runWithLifecycle` catch | Synthetic message, then `agent_end` again |
+| Run truncated by `stopReason: "length"` | agent-loop.ts:267–270 | Every tool call in that message fails, deliberately |
+
+## 10. `stream-fn.ts` and `proxy.ts`
 
 `setDefaultStreamFn` (stream-fn.ts:11) installs a process-wide fallback; `Agent` uses it when
 `streamFn` is omitted (agent.ts:236) and so does the loop (agent-loop.ts:124, 149).
@@ -319,7 +391,7 @@ the same event protocol *minus* the `partial` field on every event, to cut bandw
 "transport abstraction" in the package description: local provider call, or remote proxy,
 same loop.
 
-## 10. Contracts worth memorizing
+## 11. Contracts worth memorizing
 
 | Contract | Where | Consequence if broken |
 |---|---|---|
@@ -331,7 +403,7 @@ same loop.
 | Parallel mode: `tool_execution_end` in completion order, messages in source order | types.ts:43–45 | UI ordering bugs if you assume one order. |
 | `agent_end` ≠ idle | agent.ts:558–564 | You tear down while listeners still run. |
 
-## 11. Where to look next
+## 12. Where to look next
 
 - `test/agent-loop.test.ts`, `test/agent.test.ts`, `test/e2e.test.ts` — the loop's behavior
   pinned at the level this document describes; `test/utils/calculate.ts` is a complete

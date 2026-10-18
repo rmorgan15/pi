@@ -172,7 +172,131 @@ the final `AssistantMessage`. Subclasses stamp `durationMs` from a monotonic clo
 timing when the message's `timestamp` predates the stream — a forwarded/deferred response
 started elsewhere stays untimed.
 
-## 6. Providers
+## 6. The type lattice
+
+Four types explain the package, and they are related in one direction only — a host talks to
+`Models`, never to an adapter.
+
+```mermaid
+classDiagram
+    direction TB
+    class Models {
+        +stream(model, context, options)
+        +streamSimple(model, context, options)
+        +complete(model, context, options)
+        +getAuth(provider)
+        +getModel(id, provider)
+    }
+    class Provider {
+        +id
+        +name
+        +baseUrl
+        +auth
+        +getModels()
+        +stream(model, context, options)
+        +streamSimple(model, context, options)
+    }
+    class ProviderStreams {
+        <<interface>>
+        +stream(model, context, options)
+        +streamSimple(model, context, options)
+        +fetchDeferred(model, handle, options)
+        +cancelDeferred(model, handle, options)
+    }
+    class Model~TApi~ {
+        +id
+        +api
+        +provider
+        +contextWindow
+        +maxTokens
+    }
+    class AdapterModule {
+        <<module>>
+        +stream
+        +streamSimple
+    }
+    Models "1" o-- "*" Provider : registry
+    Provider ..> ProviderStreams : private per-Api table
+    ProviderStreams <|.. AdapterModule : structurally satisfied
+    Model ..> ProviderStreams : model.api selects the entry
+```
+
+Two asymmetry traps:
+
+- **`Provider` has no public `streams` map.** `createProvider` accepts `api` as one
+  `ProviderStreams` or a `Partial<Record<Api, ProviderStreams>>` and then flattens it: the public
+  `Provider.stream` / `streamSimple` (models.ts:213–223) dispatch by `model.api` internally. The
+  interface is deliberately flat so a host cannot reach an adapter it did not ask for.
+- **Adapters do not implement an interface in the nominal sense.** They are modules exporting
+  `stream` and `streamSimple` with matching signatures; what binds them is `ProviderStreams` at
+  the `createProvider` call site. That is why a missing `fetchDeferred` is a compile-time absence,
+  not a runtime `undefined`.
+
+`Model<TApi>` is the only generic that reaches callers: options are keyed by api through
+`ApiOptionsMap` (types.ts:282), so `models.stream(anthropicModel, …)` accepts `AnthropicOptions`
+and rejects `GoogleOptions`. `ProviderModel<TApi>` (models.ts:142) widens that to "any of the
+three model types this provider can list".
+
+## 7. Stream lifecycle
+
+The event protocol in §5 is the *content*; this is the *timing*. Note the two arrows into `Failed`
+— a setup failure never emits `start`, which is the single most common consumer surprise.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: stream or streamSimple returns synchronously
+    Created --> Failed: setup throws before start
+    Created --> Started: start
+    Started --> Text: text_start
+    Text --> Started: text_end
+    Started --> Thinking: thinking_start
+    Thinking --> Started: thinking_end
+    Started --> ToolCall: toolcall_start
+    ToolCall --> Started: toolcall_end
+    Started --> Done: done
+    Started --> Failed: error
+    Done --> [*]
+    Failed --> [*]
+```
+
+Indices interleave — a response may open thinking, text, and tool-call blocks in any order, and
+every `*_end` returns to the intermediate state until `done`. What is guaranteed is the frame:
+`start` first, then only that message's events, then exactly one terminal event.
+
+The same lifecycle from the caller's side, which is where the "returns before it works" property
+becomes visible:
+
+```mermaid
+sequenceDiagram
+    participant H as host
+    participant M as Models
+    participant L as lazyStream
+    participant A as adapter module
+    participant W as vendor API
+    H->>M: streamSimple(model, context, options)
+    M->>L: lazyStream(() => import(adapter))
+    L-->>H: AssistantMessageEventStream (returned already)
+    Note over L: nothing has been awaited yet
+    L->>A: dynamic import on first event pull
+    alt auth and request setup succeed
+        L->>W: HTTP or WebSocket request
+        W-->>L: SSE or frame chunks
+        L-->>H: start, deltas, done
+    else auth, import, or request build fails
+        L-->>H: error event carrying a full AssistantMessage
+    end
+```
+
+| Event | Consumer obligation |
+|---|---|
+| `start` | Snapshot nothing; `partial` is a live object that will mutate. |
+| `*_start` | `contentIndex` identifies the block; text and thinking blocks are empty here. |
+| `*_delta` | Append, don't replace: the partial already holds the accumulated value. |
+| `*_end` | Authoritative block value; drop any locally buffered parse state. |
+| `done` | Read `result()`; the message is final. |
+| `error` | `result()` still resolves — with `stopReason: "error"` and `errorMessage` set. |
+
+## 8. Providers
 
 A provider factory is small on purpose. OpenAI-compatible vendors are ~15 lines
 (`providers/groq.ts`, `cerebras.ts`, `deepseek.ts`, …): pass an id, base URL, auth, catalog,
@@ -205,7 +329,7 @@ and the shared `openaiCompletionsApi()`. Vendors with custom auth or quirks are 
 `BuiltinProvider` is `keyof typeof MODELS`, so catalog and factories are checked against each
 other at compile time.
 
-## 7. Adapters
+## 9. Adapters
 
 Every adapter module exports exactly the shape of `ProviderStreams`. The mid-sized
 `api/google-generative-ai.ts` (471 lines) shows the pattern:
@@ -232,7 +356,7 @@ default 60 s), never retry statuses listed in `noRetryStatuses`. The comment on
 `isRetryableProviderError` (line 23) says to re-review when either SDK is upgraded — that is a
 real maintenance trap, not decoration.
 
-## 8. Laziness
+## 10. Laziness
 
 Adapters are loaded on first use, which is what keeps a 27k-line package cheap to import:
 
@@ -247,7 +371,7 @@ requested. `models.ts` uses the same `lazyStream` for auth resolution, so the *e
 setup path is behind a synchronously-returned stream. `test/lazy-module-load.test.ts` pins
 that the module really is not imported until stream time.
 
-## 9. Catalog generation
+## 11. Catalog generation
 
 ```mermaid
 flowchart LR
@@ -268,7 +392,7 @@ Scripts in `package.json` are the whole lifecycle: `hydrate-model-data` (fetch d
 (emit JSON artifacts). `providers/data/.manifest.json` is imported by `all.ts` so the build
 knows which data it was generated against.
 
-## 10. Auth
+## 12. Auth
 
 `auth/types.ts` (255) defines the shapes: `ApiKeyAuth` and `OAuthAuth` each have `login` and
 `resolve`; resolution returns `{ auth: { apiKey?, headers?, baseUrl? }, env?, source }`, where
@@ -287,7 +411,7 @@ The OAuth flows under `auth/oauth/` are per vendor and share infrastructure:
 configured?" UI — and rejects with `ModelsError` codes `"oauth"` (refresh failed, credential
 preserved) or `"auth"` (key resolution or store failure).
 
-## 11. Tools, images, classifiers
+## 13. Tools, images, classifiers
 
 - **Tool schemas** are TypeBox (`export { Type } from "typebox"` in index.ts) or plain JSON
   Schema. `validateToolArguments` (utils/validation.ts:317) is the single gate used by
@@ -302,7 +426,7 @@ preserved) or `"auth"` (key resolution or store failure).
   (`registerFauxProvider`, `fauxAssistantMessage`, `fauxText`, `fauxToolCall`). It is exported
   from `index.ts` and is how `pi-agent-core`'s tests run the real loop with no network.
 
-## 12. Contracts worth memorizing
+## 14. Contracts worth memorizing
 
 | Contract | Where | Consequence if broken |
 |---|---|---|
@@ -312,10 +436,10 @@ preserved) or `"auth"` (key resolution or store failure).
 | `stream()` returns synchronously; setup failures become `error` events | api/lazy.ts:55, types.ts:390 | Callers wrap the call in try/catch and miss the real failure path. |
 | Only `normalizeContext` may produce `TranscriptContext` | types.ts:785 | Prompt/tools bypass the system message; adapters see them nowhere. |
 | Provider methods for unknown api/implementation return error streams/results, never throw | models.ts:1078–1089 | Missing provider support crashes a UI instead of degrading. |
-| One shared retry policy mirrored from vendor SDKs | utils/provider-retry.ts:23 | Double retries or retrying non-idempotent 4xx. |
+| One shared retry policy mirrored from vendor SDKs | utils/provider-retry.ts:25 | Double retries or retrying non-idempotent 4xx. |
 | Catalog JSON is generated; edit `data/*.json` and regenerate | providers/*.models.ts:1–2, models.generated.ts:1–2 | Hand edits are erased by `npm run generate-models`. |
 
-## 13. Where to look next
+## 15. Where to look next
 
 - `test/models-runtime.test.ts`, `test/event-stream.test.ts`, `test/validation.test.ts` — the
   four core contracts above, pinned.

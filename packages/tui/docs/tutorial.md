@@ -103,12 +103,12 @@ Four rules follow from that signature, and every component in `src/components/` 
 
 1. **`render` is pure and cheap.** It returns lines at exactly `width` visible columns —
    padding included. The runtime calls it on every frame for every mounted component, so
-   components cache (see `Box`'s `RenderCache`, components/box.ts:5–12, keyed by width,
+   components cache (see `Box`'s `RenderCache`, components/box.ts:4–9, keyed by width,
    child lines, and a background sample).
 2. **`invalidate()` is the only cache-busting signal.** Theme changes and structural edits
    call it; `Container.invalidate` (tui.ts:377) recurses to children.
 3. **Focus is separate from mounting.** `Focusable` (tui.ts:180) adds `focused: boolean`;
-   `setFocus` flips those flags (tui.ts:611–690).
+   `setFocus` flips those flags (tui.ts:598).
 4. **Mouse is hit-tested by re-rendering.** `Container.handleMouse` (tui.ts:387) maps `event.y`
    to a child by summing each child's rendered height, then rewrites `y`/`height` for the
    child — the same "rendering is the source of truth" idea.
@@ -151,9 +151,9 @@ flowchart LR
 ```
 
 `requestRender` (tui.ts:1001) coalesces: it sets a flag and defers to
-`process.nextTick`. `scheduleRender` (tui.ts:1026) enforces
+`process.nextTick`. `scheduleRender` (tui.ts:1035) enforces
 `MIN_RENDER_INTERVAL_MS = 16` (tui.ts:518) — at most ~60 fps. Input preempts that throttle via
-`requestImmediateRender` (tui.ts:1013), because a typed character must not wait for a frame
+`requestImmediateRender` (tui.ts:1012), because a typed character must not wait for a frame
 in flight: the comment there notes that even `setTimeout(0)` can cost a full 16 ms tick on
 Windows. `renderNow(force)` (tui.ts:993) is the escape hatch; `force` calls
 `resetRenderState()` so the next paint is full.
@@ -287,7 +287,83 @@ Focus restoration is the subtle part: when an overlay closes, focus returns to w
 focused before, unless something else grabbed focus meanwhile — hence the
 `overlayFocusRestore` state machine (`eligible` / `blocked` / `inactive`, tui.ts:530–690).
 
-## 10. Components
+## 10. Two state machines under the API
+
+`setFocus` looks like an assignment. It is actually a four-state machine that exists so closing an
+overlay puts the cursor back where the user left it — even if focus wandered while the overlay was
+open.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Inactive
+    Inactive --> Eligible: focus lands on a visible overlay component
+    Eligible --> Blocked: focus moves to a non-overlay that is not an overlay ancestor
+    Blocked --> Blocked: focus moves again, blockedBy updated
+    Blocked --> Eligible: focus returns into the overlay stack
+    Eligible --> Inactive: overlay closes, preFocus restored
+    Blocked --> Inactive: overlay closes, resume applied
+    Inactive --> Inactive: overlay hidden by another entry
+```
+
+The three states are literally the union at `tui.ts:343–352`:
+
+| State | Meaning | Payload |
+|---|---|---|
+| `inactive` | Nothing to restore. | — |
+| `eligible` | Focus is inside a visible overlay; closing it should restore `preFocus`. | `overlay` |
+| `blocked` | Focus left the overlay for something else; closing must consult `resume`. | `overlay`, `blockedBy`, `resume` |
+
+`resume` is the interesting field: `{ status: "restore-overlay" }` means "the overlay is still what
+the user was working in, put focus back there", while `{ status: "focus-target" }` means "focus was
+deliberately moved to this component, honour it" (`resolveBlockedOverlayFocusResume`, tui.ts:677).
+Two supporting rules keep it honest: focus moving *within* the overlay's ancestry is not a block
+(`isOverlayFocusAncestor`, tui.ts:692), and the whole state is re-validated on read — if the entry
+is no longer in the stack or no longer visible, `getVisibleOverlayFocusRestore` reports `inactive`
+(tui.ts:683–690). A stale restore can therefore never resurrect a dead overlay.
+
+### Frames: three ways in, one way out
+
+Every repaint in a regular-mode TUI goes through `doRender`. What differs is *when*:
+
+```mermaid
+sequenceDiagram
+    participant C as caller (input, stream, timer)
+    participant T as TuiBase
+    participant L as event loop
+    participant R as screen renderer
+    C->>T: requestRender()
+    T->>T: renderRequested = true
+    T->>L: process.nextTick(scheduleRender)
+    L->>T: scheduleRender()
+    alt a frame is already pending
+        T-->>C: coalesced, nothing scheduled
+    else less than 16 ms since last paint
+        T->>L: setTimeout(16 - elapsed)
+        L->>T: doRender()
+    else enough time has passed
+        T->>R: doRender() immediately
+    end
+    C->>T: requestImmediateRender() (from input)
+    T->>T: cancelRenderTimer()
+    T->>L: process.nextTick
+    L->>T: cancelRenderTimer() again, then doRender()
+    Note over T: input preempts a pending throttled frame
+```
+
+| Entry point | Behaviour | Used by |
+|---|---|---|
+| `requestRender()` (tui.ts:1001) | Coalesces: sets `renderRequested`, schedules on `nextTick`. Returns immediately if a frame is already requested. | Components, streaming updates |
+| `requestRender(true)` | `resetRenderState()` then immediate — full repaint. | Theme change, resize |
+| `requestImmediateRender()` (tui.ts:1012) | Cancels the timer and paints on `nextTick`, re-cancelling because a queued `scheduleRender` may have armed one. | Input handlers |
+| `renderNow()` (tui.ts:993) | Synchronous paint; optional `force` resets cached state first. | Startup, teardown, alt-screen switches |
+
+The double `cancelRenderTimer()` in `requestImmediateRender` is the whole reason keystrokes feel
+instant on a busy screen: the comment at tui.ts:1020–1021 spells out that a previously queued
+`scheduleRender()` can create a timer before the `nextTick` callback runs, and user input has to
+preempt that frame. The 16 ms budget itself is `MIN_RENDER_INTERVAL_MS`, enforced as
+`max(0, 16 - elapsed)` in `scheduleRender` (tui.ts:1040).
+
+## 11. Components
 
 | Component | Lines | What it does |
 |---|---:|---|
@@ -312,7 +388,7 @@ focused before, unless something else grabbed focus meanwhile — hence the
 Read `components/box.ts` (172 lines) first: it is the smallest complete component with a
 render cache, mouse routing, and background painting.
 
-## 11. Colors, images, math
+## 12. Colors, images, math
 
 - `colors.ts` models color as a discriminated union — `IndexedColor` (256-color index),
   `RgbColorValue`, `OklchColorValue` — and `styleText` emits the right escape for the target
@@ -325,7 +401,7 @@ render cache, mouse routing, and background painting.
 - `latex.ts` exposes `renderLatex` for math, so formulas render as terminal lines rather
   than an image dependency.
 
-## 12. Contracts worth memorizing
+## 13. Contracts worth memorizing
 
 | Contract | Where | Consequence if broken |
 |---|---|---|
@@ -333,11 +409,11 @@ render cache, mouse routing, and background painting.
 | Measure with `visibleWidth`, never `string.length` | utils.ts | Wide chars, emoji, and ANSI codes break layout. |
 | Call `invalidate()` when cached render state changes | tui.ts:140 | Stale frames until the next width change. |
 | One `doRender()` per screen mode; scheduling lives in `TuiBase` | tui.ts:552 | Duplicate render loops and flicker. |
-| Input must preempt the 16 ms throttle | tui.ts:1013 | Typing feels laggy on Windows/slow terminals. |
+| Input must preempt the 16 ms throttle | tui.ts:1012 | Typing feels laggy on Windows/slow terminals. |
 | Overlays composite into the base frame, never re-render the tree | tui.ts:426 | Double paint and focus desync. |
 | `VIEWPORT_TUI` means the TUI owns scrolling | tui.ts:495 | Mouse wheel and scrollbars stop working. |
 
-## 13. Where to look next
+## 14. Where to look next
 
 - `test/layout.test.ts`, `test/mouse-components.test.ts`, `test/editor.test.ts` — the
   behavior described here, pinned by tests.
