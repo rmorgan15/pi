@@ -13,7 +13,7 @@ vendor. This page maps how that is achieved and where each piece lives.
 
 | | |
 |---|---|
-| Source | 198 files, 27,080 lines in `packages/ai/src/` |
+| Source | 199 files, 27,084 lines in `packages/ai/src/` |
 | Subdirs | `api/` 43 modules, `providers/` 42 provider modules + 42 catalogs, `auth/` 5 modules + `auth/oauth/` 13 flows, `utils/` 25 modules |
 | Known wire APIs | 10 chat (`openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `anthropic-messages`, `bedrock-converse-stream`, `google-generative-ai`, `google-vertex`, `mistral-conversations`, `pi-messages`), 1 image, 2 classifier |
 | Entry | `src/index.ts` — deliberately side-effect free; providers and APIs are separate subpath entries |
