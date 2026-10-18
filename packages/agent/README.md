@@ -2,6 +2,8 @@
 
 Stateful agent with tool execution and event streaming. Built on `@earendil-works/pi-ai`.
 
+> Looking for a guided tour of the source? See [docs/tutorial.md](docs/tutorial.md) — a code map with diagrams.
+
 ## Installation
 
 ```bash

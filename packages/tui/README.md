@@ -2,6 +2,8 @@
 
 Minimal terminal UI framework with differential rendering and synchronized output for flicker-free interactive CLI applications.
 
+> Looking for a guided tour of the source? See [docs/tutorial.md](docs/tutorial.md) — a code map with diagrams.
+
 ## Features
 
 - **Interchangeable Renderers**: Shared `TUI` interface with main-screen and alternate-screen implementations
